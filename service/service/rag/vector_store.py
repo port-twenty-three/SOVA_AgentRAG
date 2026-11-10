@@ -29,7 +29,7 @@ class VectorStore:
         Параметры подключения берутся из глобального конфига (settings):
         - QDRANT_HOST
         - QDRANT_PORT
-        - QDRANT_GPC_PORT (используется как grpc_port)
+        - QDRANT_GRPC_PORT (используется как grpc_port)
         - QDRANT_PREFER_GRPC
         """
         self.client = QdrantClient(
@@ -39,34 +39,51 @@ class VectorStore:
             prefer_grpc=settings.QDRANT_PREFER_GRPC,
         )
 
-    def create_collection(self, collection_name: str, vector_size: int, distance: str = "Cosine") -> None:
+    def create_collection(
+        self,
+        collection_name: str,
+        vector_size: int,
+        distance: str = "Cosine",
+    ) -> None:
         """
         Создаёт коллекцию, если она ещё не существует.
         Включает On-Disk хранение векторов и payload для предотвращения OOM.
         """
-        if not self.client.collection_exists(collection_name):
-            self.client.create_collection(
-                collection_name=collection_name,
-                vectors_config=models.VectorParams(
-                    size=vector_size,
-                    distance=getattr(models.Distance, distance.upper()),
-                    # НАСТРОЙКА 1: Хранить сами векторы на диске, а не в RAM
-                    on_disk=True,
-                ),
-                # НАСТРОЙКА 2: Хранить метаданные (payload) на диске
-                hnsw_config=models.HnswConfigDiff(on_disk=True),
-            )
-            # Создаем индекс для поля tenant_id, чтобы фильтрация была быстрой
+        if self.client.collection_exists(collection_name):
+            logger.debug(f"Коллекция {collection_name} уже существует")
+            return
+
+        self.client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(
+                size=vector_size,
+                distance=getattr(models.Distance, distance.upper()),
+                # НАСТРОЙКА 1: Хранить сами векторы на диске, а не в RAM
+                on_disk=True,
+            ),
+            # НАСТРОЙКА 2: Хранить метаданные (payload) на диске
+            hnsw_config=models.HnswConfigDiff(on_disk=True),
+        )
+
+        # Payload-индексы. Без них фильтрация по этим полям
+        # (в query и delete_document) будет full-scan'ом.
+        for field_name in ("tenant_id", "collection", "source"):
             self.client.create_payload_index(
                 collection_name=collection_name,
-                field_name="tenant_id",
+                field_name=field_name,
                 field_schema=models.PayloadSchemaType.KEYWORD,
             )
-            logger.debug(f"Коллекция {collection_name} создана с On-Disk индексами")
-        else:
-            logger.debug(f"Коллекция {collection_name} уже существует")
 
-    def upsert_points(self, collection_name: str, points: list[dict[str, Any]]) -> None:
+        logger.debug(
+            f"Коллекция {collection_name} создана с On-Disk индексами "
+            f"(payload indexes: tenant_id, collection, source)"
+        )
+
+    def upsert_points(
+        self,
+        collection_name: str,
+        points: list[dict[str, Any]],
+    ) -> None:
         qdrant_points = [
             models.PointStruct(
                 id=p["id"],
@@ -76,18 +93,45 @@ class VectorStore:
             for p in points
         ]
 
-        # Изменяем wait=True на wait=False
-        # Qdrant примет батч в память/буфер и проиндексирует его в фоне,
-        # что сгладит пиковые нагрузки на RAM и CPU вашего ПК
-        self.client.upsert(collection_name=collection_name, points=qdrant_points, wait=False)
+        # wait=False: Qdrant принимает батч в буфер и индексирует в фоне,
+        # что сглаживает пиковые нагрузки на RAM и CPU.
+        self.client.upsert(
+            collection_name=collection_name,
+            points=qdrant_points,
+            wait=False,
+        )
         logger.debug(f"Добавлено/Обновлено {len(points)} точек в {collection_name}")
+
+    @staticmethod
+    def _build_filter(
+        filter_conditions: dict | models.Filter | None,
+    ) -> models.Filter | None:
+        """
+        Нормализует filter_conditions к models.Filter.
+
+        Принимает:
+        - None            -> None (без фильтрации)
+        - models.Filter   -> как есть
+        - dict            -> models.Filter(**dict) (pydantic рекурсивно
+                             разберёт вложенные dict в FieldCondition и т.д.)
+        """
+        if filter_conditions is None:
+            return None
+        if isinstance(filter_conditions, models.Filter):
+            return filter_conditions
+        if isinstance(filter_conditions, dict):
+            return models.Filter(**filter_conditions)
+        raise TypeError(
+            "filter_conditions must be dict | models.Filter | None, "
+            f"got {type(filter_conditions).__name__}"
+        )
 
     def search(
         self,
         collection_name: str,
         query_vector: list[float],
         limit: int = 10,
-        filter_conditions: dict | None = None,
+        filter_conditions: dict | models.Filter | None = None,
         score_threshold: float | None = None,
     ) -> list[models.ScoredPoint]:
         """
@@ -95,18 +139,18 @@ class VectorStore:
 
         Аргументы:
             collection_name (str): Имя коллекции.
-            query_vector (list[float]): Вектор запроса.
-            limit (int): Максимальное количество возвращаемых результатов. По умолчанию 10.
-            filter_conditions (dict | None): Условия фильтрации в формате Qdrant Filter.
-                Например: {"must": [{"key": "tenant_id", "match": {"value": "123"}}]}.
-            score_threshold (float | None): Минимальный порог оценки (score) для включения в результат.
+            query_vector (list[float]): Вектор запроса (одномерный).
+            limit (int): Максимальное количество возвращаемых результатов.
+            filter_conditions (dict | models.Filter | None): Условия фильтрации.
+                Поддерживаются оба формата:
+                  * dict: {"must": [{"key": "tenant_id", "match": {"value": "123"}}]}
+                  * models.Filter(...)
+            score_threshold (float | None): Минимальный порог score.
 
         Возвращает:
-            list[models.ScoredPoint]: Список найденных точек с полями id, vector, payload, score.
+            list[models.ScoredPoint]: Найденные точки (id, vector, payload, score).
         """
-        qdrant_filter = None
-        if filter_conditions:
-            qdrant_filter = models.Filter(**filter_conditions)
+        qdrant_filter = self._build_filter(filter_conditions)
 
         response = self.client.query_points(
             collection_name=collection_name,
@@ -117,8 +161,7 @@ class VectorStore:
             with_payload=True,
         )
 
-        results = response.points
-        return results
+        return response.points
 
     def delete_points(self, collection_name: str, point_ids: list[str]) -> None:
         """
@@ -128,6 +171,8 @@ class VectorStore:
             collection_name (str): Имя коллекции.
             point_ids (list[str]): Список ID точек для удаления.
         """
+        if not point_ids:
+            return
         self.client.delete(
             collection_name=collection_name,
             points_selector=models.PointIdsList(points=point_ids),
@@ -143,7 +188,8 @@ class VectorStore:
             point_id (str): Идентификатор точки.
 
         Возвращает:
-            dict | None: Словарь с данными точки (поля id, vector, payload) или None, если точка не найдена.
+            dict | None: Словарь с данными точки (id, vector, payload)
+                         или None, если точка не найдена.
         """
         results = self.client.retrieve(
             collection_name=collection_name,
